@@ -1,15 +1,9 @@
-[submodule "lib/esp-rfm69hcw"]
-	path = lib/esp-rfm69hcw
-	url = git@github.com:khoek/esp-rfm69hcw.git
 [submodule "lib/libiot"]
 	path = lib/libiot
 	url = git@github.com:khoek/libiot.git
 [submodule "lib/libesp"]
 	path = lib/libesp
 	url = git@github.com:khoek/libesp.git
-[submodule "libiot"]
-	path = libiot
-	url = git@github.com:khoek/libiot.git
-[submodule "libesp"]
-	path = libesp
-	url = git@github.com:khoek/libesp.git
+[submodule "lib/esp-rfm69hcw"]
+	path = lib/esp-rfm69hcw
+	url = git@github.com:khoek/esp-rfm69hcw.git

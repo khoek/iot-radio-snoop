@@ -17,6 +17,8 @@
 #define PIN_RFM69HCW_IRQ 32
 #define PIN_RFM69HCW_RST 22
 
+#define TASK_STACK_SIZE 4096
+
 static const char* TAG = "app";
 
 typedef struct lacrosse_payload {
@@ -53,9 +55,11 @@ static inline void bit24_to_2bit16(uint16_t* v1, uint16_t* v2, uint8_t o1, uint8
     *v2 = (((uint16_t) o2 & 0x0F) << 8) | (((uint16_t) o3) >> 0);
 }
 
-#define RAIN_MM_MAX (1000.)
+#define RAIN_MM_MAX (500.0)
 
-static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload) {
+static char log_buff[256];
+
+static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload, uint8_t rssi) {
     uint32_t rain1;
     uint32_t rain2;
     bit24_to_bit32(&rain1, payload->b[0], payload->b[1], payload->b[2]);
@@ -66,6 +70,11 @@ static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload) {
     // Rain in 1/10ths of an inch.
     uint16_t rain_in = rain1 - rain2;
     double delta_rain_mm = 0.254 * ((double) rain_in);
+
+    if (delta_rain_mm >= RAIN_MM_MAX) {
+        snprintf(log_buff, sizeof(log_buff), "too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain1, rain2);
+        esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_LOG_NOTICE, log_buff, strlen(log_buff), 2, 0);
+    }
 
     ESP_LOGI(TAG, "ltv_rv3: delta_rain(mm)=%.1lf (rain1=0x%03X, rain2=0x%03X)", delta_rain_mm, rain1, rain2);
 
@@ -103,6 +112,13 @@ static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload) {
     }
     cJSON_AddItemToObject(json_raw, "rain2", json_rain2);
 
+    cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
+    if (!json_rssi) {
+        ESP_LOGE(TAG, "%s: cannot create JSON rssi number", __func__);
+        goto handle_lacrosse_rv3_payload_out;
+    }
+    cJSON_AddItemToObject(json_root, "rssi", json_rssi);
+
     char* output = cJSON_PrintUnformatted(json_root);
     if (!output) {
         ESP_LOGE(TAG, "%s: cannot print JSON output", __func__);
@@ -118,7 +134,7 @@ handle_lacrosse_rv3_payload_out:
     cJSON_Delete(json_root);
 }
 
-static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payload) {
+static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payload, uint8_t rssi) {
     uint16_t raw_temp;
     uint16_t raw_hum;
     bit24_to_2bit16(&raw_temp, &raw_hum, payload->b[0], payload->b[1], payload->b[2]);
@@ -127,10 +143,9 @@ static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payloa
     uint16_t raw_wind_dir;
     bit24_to_2bit16(&raw_wind_speed, &raw_wind_dir, payload->b[3], payload->b[4], payload->b[5]);
 
-    // Temp in celsius.
+    // Temp in celsius
     double temp = ((double) (raw_temp - 400)) * 0.1;
-
-    // Wind speed in kph.
+    // Wind speed in kph
     double wind_speed = ((double) raw_wind_speed) * 0.1;
 
     ESP_LOGI(TAG, "ltv_wsdth04: temp(degC)=%.1lf, rel_hum=%d%%, wind_speed(kph)=%.1lf wind_dir(deg)=%d", temp, raw_hum, wind_speed, raw_wind_dir);
@@ -169,6 +184,13 @@ static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payloa
     }
     cJSON_AddItemToObject(json_root, "wind_dir_deg", json_wind_dir);
 
+    cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
+    if (!json_rssi) {
+        ESP_LOGE(TAG, "%s: cannot create JSON rssi number", __func__);
+        goto handle_lacrosse_breezepro_payload_out;
+    }
+    cJSON_AddItemToObject(json_root, "rssi", json_rssi);
+
     char* output = cJSON_PrintUnformatted(json_root);
     if (!output) {
         ESP_LOGE(TAG, "%s: cannot print JSON output", __func__);
@@ -184,7 +206,7 @@ handle_lacrosse_breezepro_payload_out:
     cJSON_Delete(json_root);
 }
 
-static void handle_lacrosse_packet(const lacrosse_packet_t* pkt) {
+static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
     uint32_t id;
     bit24_to_bit32(&id, pkt->data.id[0], pkt->data.id[1], pkt->data.id[2]);
 
@@ -194,8 +216,8 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt) {
     uint8_t true_crc8 = lacrosse_calc_crc8(pkt->raw, sizeof(pkt->raw));
     bool crc8_valid = pkt->crc8 == true_crc8;
 
-    ESP_LOGI(TAG, "packet: id=0x%06X seq=%d status=0x%02X crc=%s (0x%02X vs 0x%02X)",
-             id, seq_num, status, crc8_valid ? "OK" : "BAD", pkt->crc8, true_crc8);
+    ESP_LOGI(TAG, "packet(rssi=0x%02X): id=0x%06X seq=%d status=0x%02X crc=%s (0x%02X vs 0x%02X)",
+             rssi, id, seq_num, status, crc8_valid ? "OK" : "BAD", pkt->crc8, true_crc8);
 
     if (!crc8_valid) {
         ESP_LOGW(TAG, "bad crc!");
@@ -204,19 +226,34 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt) {
 
     switch ((id & MASK_LACROSSE_ID_TYPE) >> SHIFT_LACROSSE_ID_TYPE) {
         case LACROSSE_ID_TYPE_LTV_RV3: {
-            handle_lacrosse_ltv_rv3_payload(&pkt->data.payload);
+            handle_lacrosse_ltv_rv3_payload(&pkt->data.payload, rssi);
             break;
         }
         case LACROSSE_ID_TYPE_LTV_WSDTH04: {
-            handle_lacrosse_ltv_wsdth04_payload(&pkt->data.payload);
+            handle_lacrosse_ltv_wsdth04_payload(&pkt->data.payload, rssi);
             break;
         }
         default: {
-            ESP_LOGW(TAG, "well-formed packet with unknown id type: 0x%X", id);
-            // FIXME log this on MQTT
+            snprintf(log_buff, sizeof(log_buff), "well-formed packet with unknown id type: 0x%X", id);
+            esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_LOG_NOTICE, log_buff, strlen(log_buff), 2, 0);
             break;
         }
     }
+}
+
+static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
+    // Must read RSSI_VALUE before emptying the FIFO, since this will cause an RX restart
+    // and we get a race.
+    uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
+
+    uint8_t buff[sizeof(lacrosse_packet_t)];
+    for (int i = 0; i < sizeof(lacrosse_packet_t); i++) {
+        buff[i] = rfm69hcw_reg_read(dev, RFM69HCW_REG_FIFO);
+    }
+
+    handle_lacrosse_packet((lacrosse_packet_t*) buff, rssi);
+
+    return true;
 }
 
 static rfm69hcw_handle_t dev;
@@ -259,26 +296,11 @@ void app_run() {
 
         .payload_len = sizeof(lacrosse_packet_t),
     };
-    rfm69hcw_enter_rx(dev, &cfg);
+
+    rfm69hcw_irq_task_handle_t task;
+    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &cfg, &handle_irq, 1, TASK_STACK_SIZE, &task));
 
     // TODO consider measuring FEI
-    // TODO consider measuring RSSI
-
-    while (1) {
-        while (!(rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2) & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY)) {
-            vTaskDelay(1);
-        }
-
-        uint8_t buff[sizeof(lacrosse_packet_t)];
-        for (int i = 0; i < sizeof(lacrosse_packet_t); i++) {
-            buff[i] = rfm69hcw_reg_read(dev, RFM69HCW_REG_FIFO);
-        }
-
-        // FIXME at this point explicitly clear the FIFO?
-        // FIXME interrupts!
-
-        handle_lacrosse_packet((lacrosse_packet_t*) buff);
-    }
 }
 
 static struct node_config CONFIG = {
