@@ -9,6 +9,8 @@
 
 #define DEVICE_NAME "radio-snoop"
 
+#define MQTT_WARN_TOPIC IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "log/warn")
+
 #define PIN_SPI_SCLK 5
 #define PIN_SPI_MOSI 18
 #define PIN_SPI_MISO 19
@@ -46,90 +48,116 @@ typedef struct lacrosse_packet {
 #define LACROSSE_ID_TYPE_LTV_RV3 0x70F
 #define LACROSSE_ID_TYPE_LTV_WSDTH04 0x88F
 
-static inline void bit24_to_bit32(uint32_t* v, uint8_t o1, uint8_t o2, uint8_t o3) {
+static inline void convert_3b8_to_1b24(uint32_t* v, uint8_t o1, uint8_t o2, uint8_t o3) {
     *v = (((uint32_t) o1) << 16) | (((uint32_t) o2) << 8) | (((uint32_t) o3) << 0);
 }
 
-static inline void bit24_to_2bit16(uint16_t* v1, uint16_t* v2, uint8_t o1, uint8_t o2, uint8_t o3) {
+static inline void convert_2b8_to_1b16(uint16_t* v, uint8_t o1, uint8_t o2) {
+    *v = (((uint32_t) o1) << 8) | (((uint32_t) o2) << 0);
+}
+
+static inline void convert_3b8_to_2b16(uint16_t* v1, uint16_t* v2, uint8_t o1, uint8_t o2, uint8_t o3) {
     *v1 = (((uint16_t) o1) << 4) | (((uint16_t) o2) >> 4);
     *v2 = (((uint16_t) o2 & 0x0F) << 8) | (((uint16_t) o3) >> 0);
 }
 
-#define RAIN_MM_MAX (500.0)
-
+// Only for use on the irq dispatch thread.
 static char log_buff[256];
 
+#define MIDDLE_BYTE_MAGIC 0xAA
+
+static void check_magic_byte(uint8_t pos, uint8_t b) {
+    if (b != 0xAA) {
+        snprintf(log_buff, sizeof(log_buff), "magic byte (%d) is 0x%02X not 0x%02X!", pos, b, MIDDLE_BYTE_MAGIC);
+        ESP_LOGW(TAG, "%s", log_buff);
+        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+    }
+}
+
+#define RAIN_MM_WARN_MAX (500.0)
+
+static int32_t last_rain = -1;
+
 static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload, uint8_t rssi) {
-    uint32_t rain1;
-    uint32_t rain2;
-    bit24_to_bit32(&rain1, payload->b[0], payload->b[1], payload->b[2]);
-    bit24_to_bit32(&rain2, payload->b[3], payload->b[4], payload->b[5]);
+    check_magic_byte(1, payload->b[1]);
+    check_magic_byte(4, payload->b[4]);
+
+    uint16_t rain_now;
+    uint16_t rain_before;
+    convert_2b8_to_1b16(&rain_now, payload->b[0], payload->b[2]);
+    convert_2b8_to_1b16(&rain_before, payload->b[3], payload->b[5]);
+
+    if (rain_before != last_rain && last_rain != -1) {
+        snprintf(log_buff, sizeof(log_buff), "ltv_rv3: packet skipped! rain was 0x%02X, but last reported is 0x%02X", last_rain, rain_before);
+        ESP_LOGW(TAG, "%s", log_buff);
+        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+    }
+
+    last_rain = rain_now;
 
     // FIXME detect skips
 
     // Rain in 1/10ths of an inch.
-    uint16_t rain_in = rain1 - rain2;
+    uint16_t rain_in = rain_now - rain_before;
     double delta_rain_mm = 0.254 * ((double) rain_in);
 
-    if (delta_rain_mm >= RAIN_MM_MAX) {
-        snprintf(log_buff, sizeof(log_buff), "too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain1, rain2);
-        esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_LOG_NOTICE, log_buff, strlen(log_buff), 2, 0);
+    if (delta_rain_mm >= RAIN_MM_WARN_MAX) {
+        snprintf(log_buff, sizeof(log_buff), "ltv_rv3: too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain_now, rain_before);
+        ESP_LOGW(TAG, "%s", log_buff);
+        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
     }
 
-    ESP_LOGI(TAG, "ltv_rv3: delta_rain(mm)=%.1lf (rain1=0x%03X, rain2=0x%03X)", delta_rain_mm, rain1, rain2);
+    ESP_LOGI(TAG, "ltv_rv3: delta_rain(mm)=%.1lf (rain_now=0x%03X, rain_before=0x%03X)", delta_rain_mm, rain_now, rain_before);
 
     cJSON* json_root = cJSON_CreateObject();
     if (!json_root) {
-        ESP_LOGE(TAG, "%s: cannot create JSON root object", __func__);
         goto handle_lacrosse_rv3_payload_out;
     }
 
     cJSON* json_delta_mm = cJSON_CreateNumber(delta_rain_mm);
     if (!json_delta_mm) {
-        ESP_LOGE(TAG, "%s: cannot create JSON delta_mm number", __func__);
         goto handle_lacrosse_rv3_payload_out;
     }
     cJSON_AddItemToObject(json_root, "delta_mm", json_delta_mm);
 
     cJSON* json_raw = cJSON_CreateObject();
     if (!json_raw) {
-        ESP_LOGE(TAG, "%s: cannot create JSON raw object", __func__);
         goto handle_lacrosse_rv3_payload_out;
     }
     cJSON_AddItemToObject(json_root, "raw", json_raw);
 
-    cJSON* json_rain1 = cJSON_CreateNumber(rain1);
-    if (!json_rain1) {
-        ESP_LOGE(TAG, "%s: cannot create JSON rain1 number", __func__);
+    cJSON* json_rain_now = cJSON_CreateNumber(rain_now);
+    if (!json_rain_now) {
         goto handle_lacrosse_rv3_payload_out;
     }
-    cJSON_AddItemToObject(json_raw, "rain1", json_rain1);
+    cJSON_AddItemToObject(json_raw, "rain_now", json_rain_now);
 
-    cJSON* json_rain2 = cJSON_CreateNumber(rain2);
-    if (!json_rain2) {
-        ESP_LOGE(TAG, "%s: cannot create JSON rain2 number", __func__);
+    cJSON* json_rain_before = cJSON_CreateNumber(rain_before);
+    if (!json_rain_before) {
         goto handle_lacrosse_rv3_payload_out;
     }
-    cJSON_AddItemToObject(json_raw, "rain2", json_rain2);
+    cJSON_AddItemToObject(json_raw, "rain_before", json_rain_before);
 
     cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
     if (!json_rssi) {
-        ESP_LOGE(TAG, "%s: cannot create JSON rssi number", __func__);
         goto handle_lacrosse_rv3_payload_out;
     }
     cJSON_AddItemToObject(json_root, "rssi", json_rssi);
 
     char* output = cJSON_PrintUnformatted(json_root);
     if (!output) {
-        ESP_LOGE(TAG, "%s: cannot print JSON output", __func__);
         goto handle_lacrosse_rv3_payload_out;
     }
 
     esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "rain"), output, strlen(output), 2, 0);
 
     free(output);
+    cJSON_Delete(json_root);
+    return;
 
 handle_lacrosse_rv3_payload_out:
+    ESP_LOGE(TAG, "%s: JSON build fail", __func__);
+
     // It is safe to call this with `json_root == NULL`.
     cJSON_Delete(json_root);
 }
@@ -137,78 +165,75 @@ handle_lacrosse_rv3_payload_out:
 static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payload, uint8_t rssi) {
     uint16_t raw_temp;
     uint16_t raw_hum;
-    bit24_to_2bit16(&raw_temp, &raw_hum, payload->b[0], payload->b[1], payload->b[2]);
+    convert_3b8_to_2b16(&raw_temp, &raw_hum, payload->b[0], payload->b[1], payload->b[2]);
 
     uint16_t raw_wind_speed;
     uint16_t raw_wind_dir;
-    bit24_to_2bit16(&raw_wind_speed, &raw_wind_dir, payload->b[3], payload->b[4], payload->b[5]);
+    convert_3b8_to_2b16(&raw_wind_speed, &raw_wind_dir, payload->b[3], payload->b[4], payload->b[5]);
 
     // Temp in celsius
     double temp = ((double) (raw_temp - 400)) * 0.1;
     // Wind speed in kph
     double wind_speed = ((double) raw_wind_speed) * 0.1;
 
-    ESP_LOGI(TAG, "ltv_wsdth04: temp(degC)=%.1lf, rel_hum=%d%%, wind_speed(kph)=%.1lf wind_dir(deg)=%d", temp, raw_hum, wind_speed, raw_wind_dir);
+    ESP_LOGI(TAG, "ltv_wsdth04: temp(degC)=%.1lf, rel_hum=%d%%, wind_speed(kph)=%.1lf, wind_dir(deg)=%d", temp, raw_hum, wind_speed, raw_wind_dir);
 
     cJSON* json_root = cJSON_CreateObject();
     if (!json_root) {
-        ESP_LOGE(TAG, "%s: cannot create JSON root object", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
 
     cJSON* json_temp_c = cJSON_CreateNumber(temp);
     if (!json_temp_c) {
-        ESP_LOGE(TAG, "%s: cannot create JSON temp_c number", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
     cJSON_AddItemToObject(json_root, "temp_c", json_temp_c);
 
     cJSON* json_rel_humidity = cJSON_CreateNumber(raw_hum);
     if (!json_rel_humidity) {
-        ESP_LOGE(TAG, "%s: cannot create JSON rel_humidity number", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
     cJSON_AddItemToObject(json_root, "rel_humidity", json_rel_humidity);
 
     cJSON* json_wind_speed = cJSON_CreateNumber(wind_speed);
     if (!json_wind_speed) {
-        ESP_LOGE(TAG, "%s: cannot create JSON wind_speed number", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
     cJSON_AddItemToObject(json_root, "wind_speed_kph", json_wind_speed);
 
     cJSON* json_wind_dir = cJSON_CreateNumber(raw_wind_dir);
     if (!json_wind_dir) {
-        ESP_LOGE(TAG, "%s: cannot create JSON wind_dir number", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
     cJSON_AddItemToObject(json_root, "wind_dir_deg", json_wind_dir);
 
     cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
     if (!json_rssi) {
-        ESP_LOGE(TAG, "%s: cannot create JSON rssi number", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
     cJSON_AddItemToObject(json_root, "rssi", json_rssi);
 
     char* output = cJSON_PrintUnformatted(json_root);
     if (!output) {
-        ESP_LOGE(TAG, "%s: cannot print JSON output", __func__);
         goto handle_lacrosse_breezepro_payload_out;
     }
 
     esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "weather-station"), output, strlen(output), 2, 0);
 
     free(output);
+    cJSON_Delete(json_root);
+    return;
 
 handle_lacrosse_breezepro_payload_out:
+    ESP_LOGE(TAG, "%s: JSON build fail", __func__);
+
     // It is safe to call this with `json_root == NULL`.
     cJSON_Delete(json_root);
 }
 
 static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
     uint32_t id;
-    bit24_to_bit32(&id, pkt->data.id[0], pkt->data.id[1], pkt->data.id[2]);
+    convert_3b8_to_1b24(&id, pkt->data.id[0], pkt->data.id[1], pkt->data.id[2]);
 
     uint8_t seq_num = (pkt->data.status & MASK_LACROSSE_SEQ_NUM) >> SHIFT_LACROSSE_SEQ_NUM;
     uint8_t status = pkt->data.status & ~MASK_LACROSSE_SEQ_NUM;
@@ -216,7 +241,7 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
     uint8_t true_crc8 = lacrosse_calc_crc8(pkt->raw, sizeof(pkt->raw));
     bool crc8_valid = pkt->crc8 == true_crc8;
 
-    ESP_LOGI(TAG, "packet(rssi=0x%02X): id=0x%06X seq=%d status=0x%02X crc=%s (0x%02X vs 0x%02X)",
+    ESP_LOGI(TAG, "packet(rssi=0x%02X): id=0x%06X, seq=%d, status=0x%02X, crc=%s (0x%02X vs 0x%02X)",
              rssi, id, seq_num, status, crc8_valid ? "OK" : "BAD", pkt->crc8, true_crc8);
 
     if (!crc8_valid) {
@@ -235,13 +260,14 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
         }
         default: {
             snprintf(log_buff, sizeof(log_buff), "well-formed packet with unknown id type: 0x%X", id);
-            esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_LOG_NOTICE, log_buff, strlen(log_buff), 2, 0);
+            ESP_LOGW(TAG, "%s", log_buff);
+            esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
             break;
         }
     }
 }
 
-static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
+static void handle_payload_ready(rfm69hcw_handle_t dev) {
     // Must read RSSI_VALUE before emptying the FIFO, since this will cause an RX restart
     // and we get a race.
     uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
@@ -252,6 +278,61 @@ static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
     }
 
     handle_lacrosse_packet((lacrosse_packet_t*) buff, rssi);
+}
+
+#define MAX_WAIT_ITERS 100
+
+static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
+    int i;
+    const char* fail_msg = NULL;
+
+    for (i = 0; i < MAX_WAIT_ITERS; i++) {
+        if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2) & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY) {
+            handle_payload_ready(dev);
+            return true;
+        }
+
+        if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1) & RFM69HCW_IRQ_FLAGS_1_TIMEOUT) {
+            break;
+        }
+
+        vTaskDelay(1);
+    }
+
+    if (i >= MAX_WAIT_ITERS) {
+        fail_msg = "max iters exceeded while after RSSI sampling!";
+        goto handle_irq_out;
+    }
+
+    uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
+    uint8_t afc_value_msb = rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_MSB);
+    uint8_t afc_value_lsb = rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_LSB);
+    uint16_t afc_value = (((uint16_t) afc_value_msb) << 8) | (((uint16_t) afc_value_lsb) << 0);
+
+    uint8_t val = rfm69hcw_reg_read(dev, RFM69HCW_REG_PACKET_CONFIG_2);
+    rfm69hcw_reg_write(dev, RFM69HCW_REG_PACKET_CONFIG_2, val | RFM69HCW_PACKET_CONFIG_2_RESTART_RX);
+
+    for (i = 0; i < MAX_WAIT_ITERS; i++) {
+        if (!(rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1) & RFM69HCW_IRQ_FLAGS_1_TIMEOUT)) {
+            break;
+        }
+
+        vTaskDelay(1);
+    }
+
+    ESP_LOGI(TAG, "rssi timeout, restarting rx (rssi=0x%02X, afc_value=0x%04X)", rssi, afc_value);
+
+    if (i >= MAX_WAIT_ITERS) {
+        fail_msg = "max iters exceeded while after rx restart!";
+        goto handle_irq_out;
+    }
+
+handle_irq_out:
+    if (fail_msg) {
+        snprintf(log_buff, sizeof(log_buff), "%s (0x%02X,0x%02X,0x%02X)", fail_msg, rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE), rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1), rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
+        ESP_LOGW(TAG, "%s", log_buff);
+        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+    }
 
     return true;
 }
@@ -295,6 +376,9 @@ void app_run() {
         .sync_value = {0xD2, 0xAA, 0x2D, 0xD4, 0x00},
 
         .payload_len = sizeof(lacrosse_packet_t),
+
+        .inter_packet_rx_delay = 6,  // ~6.85ms
+        .timeout_rssi_thresh = 30,   // ~50ms
     };
 
     rfm69hcw_irq_task_handle_t task;
