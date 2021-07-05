@@ -377,6 +377,7 @@ void app_run() {
 
         .payload_len = sizeof(lacrosse_packet_t),
 
+        .rssi_thresh = 0xC0,         // -96dBm
         .inter_packet_rx_delay = 6,  // ~6.85ms
         .timeout_rssi_thresh = 30,   // ~50ms
     };
