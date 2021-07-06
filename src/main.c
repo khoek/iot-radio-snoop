@@ -271,7 +271,15 @@ static void handle_payload_ready(rfm69hcw_handle_t dev) {
     // Must read RSSI_VALUE before emptying the FIFO, since this will cause an RX restart
     // and we get a race.
     uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
+    // Note that due to an idiosyncrasy with the RFM69HCW when `RFM69HCW_AFC_FEI_AFC_AUTOCLEAR_ON` is
+    // set then at this point (i.e. even before the FIFO has been emptied) the `RFM69HCW_REG_AFC_MSB/LSB`
+    // registers have already been cleared to zero. However, if the packet never arrives and the timeout
+    // IRQ triggers then the AFC value is safe to read.
+    //
+    // If we desperately want to know the AFC value then we can disable AFC autoclear and perform the clear
+    // ourselves as part of the RSSI IRQ interrupt handler.
 
+    // Read out the FIFO contents.
     uint8_t buff[sizeof(lacrosse_packet_t)];
     for (int i = 0; i < sizeof(lacrosse_packet_t); i++) {
         buff[i] = rfm69hcw_reg_read(dev, RFM69HCW_REG_FIFO);
@@ -280,19 +288,29 @@ static void handle_payload_ready(rfm69hcw_handle_t dev) {
     handle_lacrosse_packet((lacrosse_packet_t*) buff, rssi);
 }
 
-#define MAX_WAIT_ITERS 100
+#define MAX_WAIT_ITERS 10
 
-static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
+static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
     int i;
     const char* fail_msg = NULL;
 
     for (i = 0; i < MAX_WAIT_ITERS; i++) {
+        // Has a full packet been recieved?
         if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2) & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY) {
             handle_payload_ready(dev);
             return true;
         }
 
-        if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1) & RFM69HCW_IRQ_FLAGS_1_TIMEOUT) {
+        uint8_t flags_1 = rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1);
+
+        // Is this interrupt spurious?
+        if (!(flags_1 & RFM69HCW_IRQ_FLAGS_1_RSSI)) {
+            fail_msg = "spurious IRQ (no rssi)!";
+            goto handle_irq_out;
+        }
+
+        // Have we timed out waiting for a packet?
+        if (flags_1 & RFM69HCW_IRQ_FLAGS_1_TIMEOUT) {
             break;
         }
 
@@ -300,7 +318,7 @@ static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
     }
 
     if (i >= MAX_WAIT_ITERS) {
-        fail_msg = "max iters exceeded while after RSSI sampling!";
+        fail_msg = "max iters exceeded after RSSI sampling!";
         goto handle_irq_out;
     }
 
@@ -323,7 +341,7 @@ static bool handle_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
     ESP_LOGI(TAG, "rssi timeout, restarting rx (rssi=0x%02X, afc_value=0x%04X)", rssi, afc_value);
 
     if (i >= MAX_WAIT_ITERS) {
-        fail_msg = "max iters exceeded while after rx restart!";
+        fail_msg = "max iters exceeded after rx restart!";
         goto handle_irq_out;
     }
 
@@ -383,7 +401,7 @@ void app_run() {
     };
 
     rfm69hcw_irq_task_handle_t task;
-    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &cfg, &handle_irq, 1, TASK_STACK_SIZE, &task));
+    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &cfg, &handle_rssi_irq, 1, TASK_STACK_SIZE, &task));
 
     // TODO consider measuring FEI
 }
