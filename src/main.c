@@ -9,8 +9,6 @@
 
 #define DEVICE_NAME "radio-snoop"
 
-#define MQTT_WARN_TOPIC IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "log/warn")
-
 #define PIN_SPI_SCLK 5
 #define PIN_SPI_MOSI 18
 #define PIN_SPI_MISO 19
@@ -61,16 +59,11 @@ static inline void convert_3b8_to_2b16(uint16_t* v1, uint16_t* v2, uint8_t o1, u
     *v2 = (((uint16_t) o2 & 0x0F) << 8) | (((uint16_t) o3) >> 0);
 }
 
-// Only for use on the irq dispatch thread.
-static char log_buff[256];
-
 #define MIDDLE_BYTE_MAGIC 0xAA
 
 static void check_magic_byte(uint8_t pos, uint8_t b) {
     if (b != 0xAA) {
-        snprintf(log_buff, sizeof(log_buff), "magic byte (%d) is 0x%02X not 0x%02X!", pos, b, MIDDLE_BYTE_MAGIC);
-        ESP_LOGW(TAG, "%s", log_buff);
-        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+        libiot_logf_error(TAG, "magic byte (%d) is 0x%02X not 0x%02X!", pos, b, MIDDLE_BYTE_MAGIC);
     }
 }
 
@@ -88,9 +81,7 @@ static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload, u
     convert_2b8_to_1b16(&rain_before, payload->b[3], payload->b[5]);
 
     if (rain_before != last_rain && last_rain != -1) {
-        snprintf(log_buff, sizeof(log_buff), "ltv_rv3: packet skipped! rain was 0x%02X, but last reported is 0x%02X", last_rain, rain_before);
-        ESP_LOGW(TAG, "%s", log_buff);
-        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+        libiot_logf_error(TAG, "ltv_rv3: packet skipped! rain was 0x%02X, but last reported is 0x%02X", last_rain, rain_before);
     }
 
     last_rain = rain_now;
@@ -102,9 +93,7 @@ static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload, u
     double delta_rain_mm = 0.254 * ((double) rain_in);
 
     if (delta_rain_mm >= RAIN_MM_WARN_MAX) {
-        snprintf(log_buff, sizeof(log_buff), "ltv_rv3: too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain_now, rain_before);
-        ESP_LOGW(TAG, "%s", log_buff);
-        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+        libiot_logf_error(TAG, "ltv_rv3: too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain_now, rain_before);
     }
 
     ESP_LOGI(TAG, "ltv_rv3: delta_rain(mm)=%.1lf (rain_now=0x%03X, rain_before=0x%03X)", delta_rain_mm, rain_now, rain_before);
@@ -149,7 +138,7 @@ static void handle_lacrosse_ltv_rv3_payload(const lacrosse_payload_t* payload, u
         goto handle_lacrosse_rv3_payload_out;
     }
 
-    esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "rain"), output, strlen(output), 2, 0);
+    libiot_mqtt_publish_local("rain", 2, 0, output);
 
     free(output);
     cJSON_Delete(json_root);
@@ -218,7 +207,7 @@ static void handle_lacrosse_ltv_wsdth04_payload(const lacrosse_payload_t* payloa
         goto handle_lacrosse_breezepro_payload_out;
     }
 
-    esp_mqtt_client_publish(mqtt_get_client(), IOT_MQTT_DEVICE_TOPIC(DEVICE_NAME, "weather-station"), output, strlen(output), 2, 0);
+    libiot_mqtt_publish_local("weather-station", 2, 0, output);
 
     free(output);
     cJSON_Delete(json_root);
@@ -259,9 +248,7 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
             break;
         }
         default: {
-            snprintf(log_buff, sizeof(log_buff), "well-formed packet with unknown id type: 0x%X", id);
-            ESP_LOGW(TAG, "%s", log_buff);
-            esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+            libiot_logf_error(TAG, "well-formed packet with unknown id type: 0x%X", id);
             break;
         }
     }
@@ -347,9 +334,11 @@ static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t d
 
 handle_irq_out:
     if (fail_msg) {
-        snprintf(log_buff, sizeof(log_buff), "%s (0x%02X,0x%02X,0x%02X)", fail_msg, rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE), rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1), rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
-        ESP_LOGW(TAG, "%s", log_buff);
-        esp_mqtt_client_publish(mqtt_get_client(), MQTT_WARN_TOPIC, log_buff, strlen(log_buff), 2, 0);
+        libiot_logf_error(TAG, "%s (0x%02X,0x%02X,0x%02X)",
+                          fail_msg,
+                          rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE),
+                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1),
+                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
     }
 
     return true;
