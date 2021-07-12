@@ -4,8 +4,8 @@
 #include <libiot.h>
 #include <rfm69hcw.h>
 
-#include "../../secrets/secret.radio-snoop.h"
 #include "lacrosse_crc.h"
+#include "secret.h"
 
 #define DEVICE_NAME "radio-snoop"
 
