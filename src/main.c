@@ -366,33 +366,58 @@ void app_init() {
     rfm69hcw_init(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ, &dev);
 }
 
+static const rfm69hcw_rx_config_t RFM69HCW_CFG = {
+    .data_mode = RFM69HCW_DATA_MODE_PACKET_MODE,
+    .type = RFM69HCW_MODULATION_TYPE_FSK,
+    .fsk_shaping = RFM69HCW_MODULATION_SHAPING_FSK_NONE,
+
+    .freq_khz = 915000,
+    .bit_period_ns = 106842,
+    .rx_bw = RFM69HCW_RX_BW_100_kHz,
+    .dcc_cutoff = RFM69HCW_DCC_CUTOFF_8_PERCENT,
+
+    .sync_bit_tol = 1,
+    .sync_value = {0xD2, 0xAA, 0x2D, 0xD4, 0x00},
+
+    .payload_len = sizeof(lacrosse_packet_t),
+
+    .rssi_thresh = 0xC0,         // -96dBm
+    .inter_packet_rx_delay = 6,  // ~6.85ms
+    .timeout_rssi_thresh = 30,   // ~50ms
+};
+
+#define MONITOR_TASK_DELAY_MS (60 * 1000)
+
+void task_monitor(void* unused) {
+    while (1) {
+        uint8_t op_mode = rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE);
+        if ((op_mode & MASK_RFM69HCW_OP_MODE_MODE) != RFM69HCW_OP_MODE_MODE_RX) {
+            libiot_logf_error(TAG, "monitor error: bad op mode (not rx), fixing! (0x%02X,0x%02X,0x%02X)",
+                              op_mode,
+                              rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1),
+                              rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
+
+            rfm69hcw_configure_rx(dev, &RFM69HCW_CFG);
+        }
+
+        vTaskDelay(MONITOR_TASK_DELAY_MS / portTICK_PERIOD_MS);
+    }
+}
+
 void app_run() {
     rfm69hcw_reset(dev);
 
-    rfm69hcw_rx_config_t cfg = {
-        .data_mode = RFM69HCW_DATA_MODE_PACKET_MODE,
-        .type = RFM69HCW_MODULATION_TYPE_FSK,
-        .fsk_shaping = RFM69HCW_MODULATION_SHAPING_FSK_NONE,
-
-        .freq_khz = 915000,
-        .bit_period_ns = 106842,
-        .rx_bw = RFM69HCW_RX_BW_100_kHz,
-        .dcc_cutoff = RFM69HCW_DCC_CUTOFF_8_PERCENT,
-
-        .sync_bit_tol = 1,
-        .sync_value = {0xD2, 0xAA, 0x2D, 0xD4, 0x00},
-
-        .payload_len = sizeof(lacrosse_packet_t),
-
-        .rssi_thresh = 0xC0,         // -96dBm
-        .inter_packet_rx_delay = 6,  // ~6.85ms
-        .timeout_rssi_thresh = 30,   // ~50ms
-    };
-
     rfm69hcw_irq_task_handle_t task;
-    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &cfg, &handle_rssi_irq, 1, TASK_STACK_SIZE, &task));
+    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &RFM69HCW_CFG, &handle_rssi_irq, 1, TASK_STACK_SIZE, &task));
 
     // TODO consider measuring FEI
+
+    // Note: We start the monitor task *after* `rfm69hcw_enter_rx()` to ensure that we are definitely
+    // in rx mode when the monitor starts (i.e. so that there is no race).
+    BaseType_t result = xTaskCreate(&task_monitor, "monitor_task", 2048, NULL, 10, NULL);
+    if (result != pdPASS) {
+        libiot_logf_error(TAG, "failed to create irq task! (0x%X)", result);
+    }
 }
 
 static struct node_config CONFIG = {
