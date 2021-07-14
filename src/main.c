@@ -363,7 +363,7 @@ void app_init() {
     ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &buscfg, 1));
 
     // Configure the ESP32 to communicate with the RFM69HCW on "HSPI".
-    rfm69hcw_init(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ, &dev);
+    ESP_ERROR_CHECK(rfm69hcw_init(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ, &dev));
 }
 
 static const rfm69hcw_rx_config_t RFM69HCW_CFG = {
