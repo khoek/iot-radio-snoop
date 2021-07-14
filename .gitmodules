@@ -7,3 +7,6 @@
 [submodule "lib/esp-rfm69hcw"]
 	path = lib/esp-rfm69hcw
 	url = git@github.com:khoek/esp-rfm69hcw.git
+[submodule "lib/esp-tmp117"]
+	path = lib/esp-tmp117
+	url = git@github.com:khoek/esp-tmp117.git
