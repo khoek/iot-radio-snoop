@@ -56,28 +56,6 @@ void temp_init(i2c_port_t port, uint8_t addr) {
 
     // Configure the ESP32 to communicate with the TMP117 on `port`.
     ESP_ERROR_CHECK(tmp117_init(port, addr, &dev));
-
-    /* FIXME show dad
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_CONFIGURATION));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_THIGH_LIMIT));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_TLOW_LIMIT));
-
-    ESP_LOGE(TAG, "");
-
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_TEMP_RESULT));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_TEMP_OFFSET));
-
-    ESP_LOGE(TAG, "");
-
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_EEPROM_UL));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_EEPROM1));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_EEPROM2));
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_EEPROM3));
-
-    ESP_LOGE(TAG, "");
-
-    ESP_LOGE(TAG, "XXX 0x%04X", tmp117_reg_read(dev, TMP117_REG_DEVICE_ID));
-    */
 }
 
 void task_temp_report(void* unused) {
