@@ -4,7 +4,6 @@
 #include <device/rfm69hcw.h>
 #include <device/tmp117.h>
 #include <esp_log.h>
-#include <libesp.h>
 #include <libiot.h>
 
 #include "secret.h"
