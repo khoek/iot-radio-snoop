@@ -1,4 +1,3 @@
-
 #include <device/ccs811.h>
 #include <device/dps368.h>
 #include <device/rfm69hcw.h>
@@ -101,7 +100,7 @@ static node_config_t CONFIG = {
     .mqtt_pass = SECRET_MQTT_PASS,
     .mqtt_cb = NULL,
 
-    .app_run = &app_run,
+    .app_run = app_run,
 };
 
 void app_main() {
