@@ -1,15 +1,15 @@
-#include "radio.h"
-
 #include <cJSON.h>
+#include <device/rfm69hcw.h>
 #include <esp_log.h>
+#include <libcrc.h>
 #include <libiot.h>
-#include <rfm69hcw.h>
+#include <libirq.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "lacrosse_crc.h"
+#include "../sensor.h"
 
-static const char* TAG = "radio";
+static const char* TAG = "sensor(rfm69hcw)";
 
 typedef struct lacrosse_payload {
     uint8_t b[6];
@@ -217,7 +217,7 @@ static void handle_lacrosse_packet(const lacrosse_packet_t* pkt, uint8_t rssi) {
     uint8_t seq_num = (pkt->data.status & MASK_LACROSSE_SEQ_NUM) >> SHIFT_LACROSSE_SEQ_NUM;
     uint8_t status = pkt->data.status & ~MASK_LACROSSE_SEQ_NUM;
 
-    uint8_t true_crc8 = lacrosse_calc_crc8(pkt->raw, sizeof(pkt->raw));
+    uint8_t true_crc8 = crc8_calc_lacrosse(pkt->raw, sizeof(pkt->raw));
     bool crc8_valid = pkt->crc8 == true_crc8;
 
     ESP_LOGI(TAG, "packet(rssi=0x%02X): id=0x%06X, seq=%d, status=0x%02X, crc=%s (0x%02X vs 0x%02X)",
@@ -267,15 +267,16 @@ static void handle_payload_ready(rfm69hcw_handle_t dev) {
 
 #define MAX_WAIT_ITERS 10
 
-static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t dev) {
-    int i;
+static void handle_rssi_irq(rfm69hcw_handle_t dev) {
     const char* fail_msg = NULL;
+
+    int i;
 
     for (i = 0; i < MAX_WAIT_ITERS; i++) {
         // Has a full packet been recieved?
         if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2) & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY) {
             handle_payload_ready(dev);
-            return true;
+            return;
         }
 
         uint8_t flags_1 = rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1);
@@ -283,7 +284,7 @@ static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t d
         // Is this interrupt spurious?
         if (!(flags_1 & RFM69HCW_IRQ_FLAGS_1_RSSI)) {
             fail_msg = "spurious IRQ (no rssi)!";
-            goto handle_irq_out;
+            goto handle_rssi_irq_out;
         }
 
         // Have we timed out waiting for a packet?
@@ -296,7 +297,7 @@ static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t d
 
     if (i >= MAX_WAIT_ITERS) {
         fail_msg = "max iters exceeded after RSSI sampling!";
-        goto handle_irq_out;
+        goto handle_rssi_irq_out;
     }
 
     uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
@@ -319,10 +320,10 @@ static bool handle_rssi_irq(rfm69hcw_irq_task_handle_t task, rfm69hcw_handle_t d
 
     if (i >= MAX_WAIT_ITERS) {
         fail_msg = "max iters exceeded after rx restart!";
-        goto handle_irq_out;
+        goto handle_rssi_irq_out;
     }
 
-handle_irq_out:
+handle_rssi_irq_out:
     if (fail_msg) {
         libiot_logf_error(TAG, "%s (0x%02X,0x%02X,0x%02X)",
                           fail_msg,
@@ -330,15 +331,6 @@ handle_irq_out:
                           rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1),
                           rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
     }
-
-    return true;
-}
-
-static rfm69hcw_handle_t dev;
-
-void radio_init(spi_host_device_t host, gpio_num_t pin_cs, gpio_num_t pin_rst, gpio_num_t pin_irq) {
-    // Configure the ESP32 to communicate with the RFM69HCW on `host`.
-    ESP_ERROR_CHECK(rfm69hcw_init(host, pin_cs, pin_rst, pin_irq, &dev));
 }
 
 static const rfm69hcw_rx_config_t RFM69HCW_CFG = {
@@ -363,7 +355,9 @@ static const rfm69hcw_rx_config_t RFM69HCW_CFG = {
 
 #define MONITOR_TASK_DELAY_MS (60 * 1000)
 
-void task_monitor(void* unused) {
+void task_monitor(void* arg) {
+    rfm69hcw_handle_t dev = arg;
+
     while (1) {
         uint8_t op_mode = rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE);
         if ((op_mode & MASK_RFM69HCW_OP_MODE_MODE) != RFM69HCW_OP_MODE_MODE_RX) {
@@ -379,20 +373,26 @@ void task_monitor(void* unused) {
     }
 }
 
+#define IRQ_TASK_CORE_NUM 1
+
 #define IRQ_TASK_STACK_SIZE 4096
 #define MONITOR_TASK_STACK_SIZE 4096
 
-void radio_start() {
-    rfm69hcw_reset(dev);
+void sensor_rfm69hcw_init(spi_host_device_t host, gpio_num_t pin_cs, gpio_num_t pin_rst, gpio_num_t pin_irq) {
+    rfm69hcw_handle_t dev;
 
-    rfm69hcw_irq_task_handle_t task;
-    ESP_ERROR_CHECK(rfm69hcw_enter_rx(dev, &RFM69HCW_CFG, &handle_rssi_irq, 1, IRQ_TASK_STACK_SIZE, &task));
+    // Configure the ESP32 to communicate with the RFM69HCW on `host`.
+    ESP_ERROR_CHECK(rfm69hcw_init(host, pin_cs, pin_rst, pin_irq, &dev));
+    rfm69hcw_configure_rx(dev, &RFM69HCW_CFG);
+
+    irq_task_handle_t task;
+    ESP_ERROR_CHECK(libirq_create(pin_irq, true, (handle_irq_fn_t) handle_rssi_irq, dev, IRQ_TASK_CORE_NUM, IRQ_TASK_STACK_SIZE, &task));
 
     // TODO consider measuring FEI
 
     // Note: We start the monitor task *after* `rfm69hcw_enter_rx()` to ensure that we are definitely
     // in rx mode when the monitor starts (i.e. so that there is no race).
-    BaseType_t result = xTaskCreate(&task_monitor, "monitor_task", MONITOR_TASK_STACK_SIZE, NULL, 10, NULL);
+    BaseType_t result = xTaskCreate(&task_monitor, "monitor_task", MONITOR_TASK_STACK_SIZE, (void*) dev, 10, NULL);
     if (result != pdPASS) {
         libiot_logf_error(TAG, "failed to create irq task! (0x%X)", result);
     }
