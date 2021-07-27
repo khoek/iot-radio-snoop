@@ -1,12 +1,9 @@
-#include <device/ccs811.h>
-#include <device/dps368.h>
-#include <device/rfm69hcw.h>
-#include <device/tmp117.h>
 #include <esp_log.h>
+#include <libi2c.h>
 #include <libiot.h>
+#include <libsensor-drivers.h>
 
 #include "secret.h"
-#include "sensor.h"
 
 #define DEVICE_NAME "radio-snoop"
 
@@ -21,14 +18,26 @@
 #define PIN_I2C_SCL 22
 #define PIN_I2C_SDA 23
 
-#define TMP117_I2C_ADDR1 0x48
-#define TMP117_I2C_ADDR2 0x49
-#define DPS368_I2C_ADDR 0x77
-#define CCS811_I2C_ADDR 0x5A
+// FIXME move all of this to the libsensor-drivers lib
+// Coming...
+#define AS7341_I2C_ADDR 0x39
+#define SI1145_I2C_ADDR 0x60
 
 static const char* TAG = "app";
 
-void app_run() {
+static void mqtt_event_handler_cb(esp_mqtt_event_handle_t event) {
+    if (event->event_id != MQTT_EVENT_DATA) {
+        return;
+    }
+
+    libsensor_dispatch_mqtt_message(event->topic, event->topic_len, event->data, event->data_len);
+}
+
+static void app_init() {
+    libsensor_init();
+}
+
+static void app_run() {
     // Configure the "HSPI" SPI peripheral.
     spi_bus_config_t buscfg = {
         .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK | SPICOMMON_BUSFLAG_MOSI | SPICOMMON_BUSFLAG_MISO,
@@ -54,37 +63,20 @@ void app_run() {
         .master.clk_speed = 100000,
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
-    // FIXME hack? (13.1071875ms @80MHz, note ccs811 datasheet says max clock stretch is 100ms!)
-    // FIXME are there still timeout problems with the ccs811?
+    // NOTE: The CCS811 uses clock stretching, neccesitating the use of this (max) timeout.
     ESP_ERROR_CHECK(i2c_set_timeout(I2C_NUM_0, 0xFFFFF));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0));
 
-    // FIXME FIXME FIXME create "libisr" to have very lightweight messages passed from
-    // a GPIO isr, so this fits into the sensor framework (and then change the driver around)
-    sensor_rfm69hcw_init(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ);
+    i2c_7bit_general_call_reset(I2C_NUM_0);
 
-    {
-        tmp117_handle_t dev;
-
-        // ESP_ERROR_CHECK(tmp117_init(I2C_NUM_0, TMP117_I2C_ADDR1, &dev));
-        // ESP_ERROR_CHECK(libsensor_create(&SENSOR_TMP117, "wired-1", dev));
-        ESP_ERROR_CHECK(tmp117_init(I2C_NUM_0, TMP117_I2C_ADDR2, &dev));
-        ESP_ERROR_CHECK(libsensor_create(&SENSOR_TMP117, "wired-2", dev));
-    }
-
-    {
-        dps368_handle_t dev;
-
-        ESP_ERROR_CHECK(dps368_init(I2C_NUM_0, DPS368_I2C_ADDR, &dev));
-        ESP_ERROR_CHECK(libsensor_create(&SENSOR_DPS368, "wired", dev));
-    }
-
-    {
-        ccs811_handle_t dev;
-
-        ESP_ERROR_CHECK(ccs811_init(I2C_NUM_0, CCS811_I2C_ADDR, &dev));
-        ESP_ERROR_CHECK(libsensor_create(&SENSOR_CCS811, "wired", dev));
-    }
+    // Register all of the sensor drivers for this device.
+    libsensor_drv_register_rfm69hcw_lacrosse(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ, "1");
+    // libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_GND, "1");
+    libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_VCC, "2");
+    // libsensor_drv_register_dps368(I2C_NUM_0, DPS368_I2C_ADDR_HIGH, "1");
+    libsensor_drv_register_ccs811(I2C_NUM_0, CCS811_I2C_ADDR_LOW, "1", true);
+    libsensor_drv_register_scd41(I2C_NUM_0, SCD41_I2C_ADDR, "1", true);
+    libsensor_drv_register_bme280(I2C_NUM_0, BME280_I2C_ADDR_HIGH, "1");
 
     ESP_LOGI(TAG, "started");
 }
@@ -98,8 +90,9 @@ static node_config_t CONFIG = {
     .cert = SECRET_MQTT_CERT,
     .key = SECRET_MQTT_KEY,
     .mqtt_pass = SECRET_MQTT_PASS,
-    .mqtt_cb = NULL,
+    .mqtt_cb = mqtt_event_handler_cb,
 
+    .app_init = app_init,
     .app_run = app_run,
 };
 
