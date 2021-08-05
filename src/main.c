@@ -30,17 +30,23 @@ static void mqtt_event_handler_cb(esp_mqtt_event_handle_t event) {
         return;
     }
 
-    libsensor_dispatch_mqtt_message(event->topic, event->topic_len, event->data, event->data_len);
+    libsensor_dispatch_mqtt_message(event->topic, event->topic_len, event->data,
+                                    event->data_len);
 }
 
 static void app_init() {
+    // This call has to happen here, because it is guarenteed that the MQTT
+    // event handler will not be called until after `app_init()` returns---
+    // and we call `libsensor_dispatch_mqtt_message()` inside the event
+    // handler, so we need libsensor to be initialized by then.
     libsensor_init();
 }
 
 static void app_run() {
     // Configure the "HSPI" SPI peripheral.
     spi_bus_config_t buscfg = {
-        .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK | SPICOMMON_BUSFLAG_MOSI | SPICOMMON_BUSFLAG_MISO,
+        .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK
+                 | SPICOMMON_BUSFLAG_MOSI | SPICOMMON_BUSFLAG_MISO,
 
         .miso_io_num = PIN_SPI_MISO,
         .mosi_io_num = PIN_SPI_MOSI,
@@ -63,20 +69,34 @@ static void app_run() {
         .master.clk_speed = 100000,
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
-    // NOTE: The CCS811 uses clock stretching, neccesitating the use of this (max) timeout.
+    // NOTE: The CCS811 uses clock stretching, neccesitating the use of this
+    // (max) timeout.
     ESP_ERROR_CHECK(i2c_set_timeout(I2C_NUM_0, 0xFFFFF));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0));
 
     i2c_7bit_general_call_reset(I2C_NUM_0);
 
-    // Register all of the sensor drivers for this device.
-    libsensor_drv_register_rfm69hcw_lacrosse(HSPI_HOST, PIN_RFM69HCW_CS, PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ, "1");
-    // libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_GND, "1");
-    libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_VCC, "2");
-    // libsensor_drv_register_dps368(I2C_NUM_0, DPS368_I2C_ADDR_HIGH, "1");
+    // Register all of the sensor drivers for this node.
+
+    // Connected internally, inside the ESP32 enclosure.
+    libsensor_drv_register_rfm69hcw_lacrosse(HSPI_HOST, PIN_RFM69HCW_CS,
+                                             PIN_RFM69HCW_RST, PIN_RFM69HCW_IRQ,
+                                             "1");
+
+    // Connected via the sensor hub in the white square case.
+    libsensor_drv_register_bme280(I2C_NUM_0, BME280_I2C_ADDR_HIGH, "1");
     libsensor_drv_register_ccs811(I2C_NUM_0, CCS811_I2C_ADDR_LOW, "1", true);
     libsensor_drv_register_scd41(I2C_NUM_0, SCD41_I2C_ADDR, "1", true);
-    libsensor_drv_register_bme280(I2C_NUM_0, BME280_I2C_ADDR_HIGH, "1");
+    libsensor_drv_register_sgp40(I2C_NUM_0, SGP40_I2C_ADDR, "1", true);
+    libsensor_drv_register_sps30(I2C_NUM_0, SPS30_I2C_ADDR, "1");
+    libsensor_drv_register_sfa30(I2C_NUM_0, SFA30_I2C_ADDR, "1");
+
+    // Connected via the PCA9615 differential bridge.
+    libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_GND, "1");
+    libsensor_drv_register_tmp117(I2C_NUM_0, TMP117_I2C_ADDR_VCC, "2");
+
+    // FIXME This one is just for fun---remove later.
+    libsensor_drv_register_dps368(I2C_NUM_0, DPS368_I2C_ADDR_LOW, "1");
 
     ESP_LOGI(TAG, "started");
 }
